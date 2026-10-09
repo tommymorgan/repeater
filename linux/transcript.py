@@ -70,6 +70,8 @@ class TranscriptPane(Gtk.Stack):
         self._expanders = []
         self._timeline_segments = None
         self._timeline_built = False
+        self._build_generation = 0
+        self._review_enabled = True
         self.set_vhomogeneous(False)
         self.controls = Gtk.Box(spacing=8, halign=Gtk.Align.END, valign=Gtk.Align.CENTER)
         self.controls.set_visible(False)
@@ -334,11 +336,27 @@ class TranscriptPane(Gtk.Stack):
                 turns[-1].append(segment)
             else:
                 turns.append([segment])
-        for index, turn in enumerate(turns):
+        self._build_generation += 1
+        generation = self._build_generation
+        for index, turn in enumerate(turns[:40]):
             self._append_thread(turn, index == len(turns) - 1)
         self.has_speech = bool(segments)
         self.controls.set_visible(self.has_speech)
         self._update_expand_caption()
+        remaining = iter(turns[40:])
+        def pump():
+            if generation != self._build_generation:
+                return GLib.SOURCE_REMOVE
+            for _batch in range(25):
+                turn = next(remaining, None)
+                if turn is None:
+                    if self._review_findings:
+                        self._render_review()
+                    return GLib.SOURCE_REMOVE
+                self._append_thread(turn, False)
+            return GLib.SOURCE_CONTINUE
+        if len(turns) > 40:
+            GLib.idle_add(pump)
 
     @staticmethod
     def _shape(payload):
@@ -384,7 +402,16 @@ class TranscriptPane(Gtk.Stack):
     def set_review(self, findings, action=None, play=None, enabled=True):
         new_findings = [f['id'] for f in findings] != [f['id'] for f in self._review_findings]
         self._review_findings = findings
+        self._review_enabled = enabled
         self.review_action, self.review_play = action, play
+        self._render_review()
+        if findings and new_findings:
+            for expander in self._expanders:
+                expander.set_expanded(True)
+
+    def _render_review(self):
+        findings = self._review_findings
+        action, play, enabled = self.review_action, self.review_play, self._review_enabled
         for index, buffer in self._buffers.items():
             tag = buffer.get_tag_table().lookup('review-suspect')
             if tag is None:
@@ -426,9 +453,6 @@ class TranscriptPane(Gtk.Stack):
                     slot.append(actions)
                     if alignment != 'word':
                         slot.append(_label('Word timing unavailable', 'dim-label', wrap=True))
-        if findings and new_findings:
-            for expander in self._expanders:
-                expander.set_expanded(True)
 
     def _editor(self, segment):
         index = segment['_index']
@@ -477,6 +501,7 @@ class TranscriptPane(Gtk.Stack):
         self._payload = None
         self._timeline_segments = None
         self._timeline_built = False
+        self._build_generation += 1
         self._buffers.clear()
         self._editors.clear()
         self._play_buttons.clear()
