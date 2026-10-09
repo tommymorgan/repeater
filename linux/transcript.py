@@ -3,7 +3,7 @@
 import gi
 
 gi.require_version('Gtk', '4.0')
-from gi.repository import Gdk, Gtk, Pango
+from gi.repository import Gdk, GLib, Gtk, Pango
 from transcribe import speaker_label
 
 
@@ -68,6 +68,8 @@ class TranscriptPane(Gtk.Stack):
         self.has_speech = False
         self._payload = None
         self._expanders = []
+        self._timeline_segments = None
+        self._timeline_built = False
         self.set_vhomogeneous(False)
         self.controls = Gtk.Box(spacing=8, halign=Gtk.Align.END, valign=Gtk.Align.CENTER)
         self.controls.set_visible(False)
@@ -127,6 +129,21 @@ class TranscriptPane(Gtk.Stack):
                 self.stop_playback()
             self.set_visible_child_name(name)
             self._expand_slot.set_visible_child_name('action' if name == 'thread' else 'blank')
+            if name == 'timeline':
+                self._ensure_timeline()
+
+    def _ensure_timeline(self):
+        if self._timeline_built or self._timeline_segments is None:
+            return
+        self._timeline_built = True
+        remaining = iter(self._timeline_segments)
+        def pump():
+            for _batch, segment in enumerate(remaining):
+                self._append_timeline(segment)
+                if _batch >= 24:
+                    return GLib.SOURCE_CONTINUE
+            return GLib.SOURCE_REMOVE
+        GLib.idle_add(pump)
 
     def _update_expand_caption(self):
         expanded = bool(self._expanders) and all(row.get_expanded() for row in self._expanders)
@@ -180,32 +197,37 @@ class TranscriptPane(Gtk.Stack):
         """Per-turn speaker controls: confirm (✓), reassign, rename-all."""
         if self._payload.get('schemaVersion') != 2 or not self.speaker_action:
             return Gtk.Box()
-        popover = Gtk.Popover()
-        column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
-                         margin_top=8, margin_bottom=8, margin_start=8, margin_end=8)
-        popover.set_child(column)
         speaker = next((entry for entry in self._payload['speakers']
                         if entry['id'] == segment.get('speakerId')), None)
         name = (speaker or {}).get('name') or (speaker or {}).get('label') or 'speaker'
         confirmed = segment.get('speakerConfirmed') is not None
-        state = Gtk.Label(xalign=0, wrap=True)
-        state.set_text(f'{"✓ Confirmed" if confirmed else "Not confirmed yet"} · {name} ({segment["source"]})')
-        column.append(state)
-        confirm = Gtk.Button(label='Unconfirm' if confirmed else '✓ Confirm speaker')
-        confirm.connect('clicked', lambda *_: self.speaker_action('confirm', segment['_index'], None))
-        column.append(confirm)
-        self._hint_rows(segment, column)
-        others = [entry for entry in self._payload['speakers']
-                  if entry['source'] == segment['source'] and entry['id'] != segment.get('speakerId')]
-        if others:
-            column.append(_label('This snippet is someone else:', 'caption'))
-            for entry in others:
-                choice = Gtk.Button(label=entry.get('name') or entry['label'])
-                choice.connect('clicked', lambda *_, sid=entry['id']: self.speaker_action('reassign', segment['_index'], sid))
-                column.append(choice)
-        rename = Gtk.Button(label='Rename this speaker everywhere…')
-        rename.connect('clicked', lambda *_: self.speaker_action('rename', segment['_index'], None))
-        column.append(rename)
+        popover = Gtk.Popover()
+        def build_once(*_):
+            if popover.get_child() is not None:
+                return
+            column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                             margin_top=8, margin_bottom=8, margin_start=8, margin_end=8)
+            state = Gtk.Label(xalign=0, wrap=True)
+            state.set_text(f'{"✓ Confirmed" if confirmed else "Not confirmed yet"} · {name} ({segment["source"]})')
+            column.append(state)
+            confirm = Gtk.Button(label='Unconfirm' if confirmed else '✓ Confirm speaker')
+            confirm.connect('clicked', lambda *_: self.speaker_action('confirm', segment['_index'], None))
+            column.append(confirm)
+            self._hint_rows(segment, column)
+            others = [entry for entry in self._payload['speakers']
+                      if entry['source'] == segment['source'] and entry['id'] != segment.get('speakerId')]
+            if others:
+                column.append(_label('This snippet is someone else:', 'caption'))
+                for entry in others:
+                    choice = Gtk.Button(label=entry.get('name') or entry['label'])
+                    choice.connect('clicked', lambda *_, sid=entry['id']:
+                                   self.speaker_action('reassign', segment['_index'], sid))
+                    column.append(choice)
+            rename = Gtk.Button(label='Rename this speaker everywhere…')
+            rename.connect('clicked', lambda *_: self.speaker_action('rename', segment['_index'], None))
+            column.append(rename)
+            popover.set_child(column)
+        popover.connect('map', build_once)
         button = Gtk.MenuButton(icon_name='avatar-default-symbolic', tooltip_text=f'Confirm or edit {name}')
         button.set_popover(popover)
         button.add_css_class('flat')
@@ -299,6 +321,8 @@ class TranscriptPane(Gtk.Stack):
         self._payload = payload
         segments = [dict(segment, _index=index) for index, segment in enumerate(payload['segments'])]
         segments.sort(key=lambda s: (s['startTime'], s['endTime'], s['source']))
+        self._timeline_segments = segments
+        self._timeline_built = False
         turns = []
         for segment in segments:
             previous = turns[-1][-1] if turns else None
@@ -310,7 +334,6 @@ class TranscriptPane(Gtk.Stack):
                 turns[-1].append(segment)
             else:
                 turns.append([segment])
-            self._append_timeline(segment)
         for index, turn in enumerate(turns):
             self._append_thread(turn, index == len(turns) - 1)
         self.has_speech = bool(segments)
@@ -452,7 +475,8 @@ class TranscriptPane(Gtk.Stack):
         self.text = ''
         self.has_speech = False
         self._payload = None
-        self._expanders.clear()
+        self._timeline_segments = None
+        self._timeline_built = False
         self._buffers.clear()
         self._editors.clear()
         self._play_buttons.clear()
