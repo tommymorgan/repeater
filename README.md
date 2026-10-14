@@ -43,7 +43,7 @@ If you find this useful or just think the idea is cool, give it a star. It'll ma
 
 ## Contents
 
-[What it does](#what-it-does) · [Privacy: what leaves your Mac](#privacy-what-leaves-your-mac) · [Getting started](#getting-started) · [Keyboard shortcuts](#keyboard-shortcuts) · [Tech stack](#tech-stack) · [Build from source](#build-from-source) · [Want to help?](#want-to-help-) · [Known issues](#known-issues-im-working-on-it) · [Similar projects](#similar-projects)
+[What it does](#what-it-does) · [Privacy: what leaves your Mac](#privacy-what-leaves-your-mac) · [Getting started](#getting-started) · [Keyboard shortcuts](#keyboard-shortcuts) · [Tech stack](#tech-stack) · [Build from source](#build-from-source) · [Linux](#linux-quick-start) · [Want to help?](#want-to-help-) · [Known issues](#known-issues-im-working-on-it) · [Similar projects](#similar-projects)
 
 ## What it does
 
@@ -263,6 +263,32 @@ make run
 - **Build with `make`, not Xcode's UI.** Xcode's explicit-modules build intermittently races on WhisperKit's dependencies. `make xcode` regenerates the project from `project.yml` if you want the IDE; keep the actual builds on `make`.
 - **Permissions and rebuilds.** macOS ties the audio and microphone grants to the signing identity, so ad-hoc builds re-ask after every rebuild. `make signing-help` shows two free ways to make them stick.
 - **Finding your way:** [FILEMAP.md](FILEMAP.md) has one line per source file; [AGENTS.md](AGENTS.md) has the layout and conventions; [CONTRIBUTING.md](CONTRIBUTING.md) is the human orientation.
+
+## Linux quick start
+
+**The Repeater** is the Linux fork of Parrot: a native GTK desktop application, two-track local recording and post-recording offline transcription. Choose **Multitalker Parakeet** (four voices per mixed source, English) or **Nemotron 3.5 + diarization** (eight slots, 32 language locales) manually under **Settings → Model**. Neither supports more than eight speakers per mixed source; capacity is not a quality guarantee. New transcripts show neutral source-scoped speakers and retain overlapping recognized words with genuine decoder timing. Legacy Me/Them transcripts still open unchanged. Active/Archived history, Archive/Restore, whole-recording OS Trash, direct editing, persistent Undo/Redo and per-entry Play/Stop remain available. Failed transcription preserves the previous generation and corrections. This is not the macOS app or a claim of live transcription, AEC, isolated-speaker playback or perfect overlap recovery.
+
+**Review transcript** adds local-model listening candidates inline in the editable paragraphs, word-timed excerpts plus whole-clip context, and Keep/Commit edit/Skip without a checkbox or listening gate. **Done reviewing** returns to the same recording; review progress and original-ASR/correction/playback histories persist across reopening. New transcriptions retain word timing; older recordings explicitly use whole-clip context until retranscribed. Configure the endpoint/model under **Settings → Transcript review**; on junkman, `REPEATER_REVIEW_URL=http://10.97.87.40:8080/v1 make gui` uses the existing local LocalAI service. Findings are suggestions, not verified errors or automatic fixes.
+
+If review fails, the recording-specific recovery card preserves prior progress and offers Retry review, Settings and collapsed, copyable Technical details. The endpoint must support strict JSON-schema structured output, and the model must have enough effective per-request context for the whole transcript; the app text-size bound does not establish that capacity. The existing junkman LocalAI alias now has a verified 32K one-request window. See [Linux review configuration, verification and limits](docs/linux-port.md#review-suspicious-passages).
+
+The GUI additionally needs Python PyGObject, GTK 4, libadwaita 1.5 or newer, and GStreamer with base/good plugins. On Arch/EndeavourOS: `python-gobject`, `gtk4`, `libadwaita`, `gstreamer`, `gst-plugins-base`, `gst-plugins-good`.
+
+```bash
+make                         # syntax sanity only; never starts recording
+make linux-setup             # both pinned runtimes/models; Parakeet CUDA
+# Or: make linux-setup PROFILE=multitalker-parakeet MODE=cpu
+make gui                     # register The Repeater name/logo and open the native app
+make install-desktop         # install/update menu branding without opening the app
+```
+
+Choose the model manually before transcription. Fresh settings default to Nemotron 3.5 because meetings commonly exceed four remote voices; existing Whisper settings require an explicit new choice without rewriting them on load. Both model path configurations survive switching. Turn off **Use GPU** for CPU inference. Enter a title, select the microphone and call output, then click **Record**. **Stop recording** saves audio and queues the selected model when automatic transcription is enabled. You can record the next conversation while an older one transcribes. Automatic and manually requested transcriptions share one first-in, first-out queue, shown in the app; inference runs one recording at a time. The queue is in memory, not restored after closing the app; saved audio remains available for later transcription. Saved CLI recordings appear in the same history.
+
+The CLI remains available: `make devices` lists devices, and `make record ARGS="--duration 30 --transcribe --cpu"` explicitly records 30 seconds. Without `--duration`, Ctrl+C stops and saves. Bare CLI and `make run` show help only.
+
+Use headphones: Linux capture has no AEC. The selected output monitor records **all audio routed to that output**, not only the call. Obtain consent before recording. Sessions live outside the repo in `${XDG_DATA_HOME:-$HOME/.local/share}/parrot/meetings/`. Recording/transcription do not upload data; optional review sends transcript text, never audio, to your configured local model endpoint with no cloud fallback.
+
+For prerequisites, GUI workflows, existing-session transcription, multilingual models, privacy and remaining scope, see [docs/linux-port.md](docs/linux-port.md).
 
 ## What's next (my wishlist)
 

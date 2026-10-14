@@ -3,6 +3,37 @@
 One line per source file, so you can find the right file without grepping the
 tree. Line counts are rough — they flag which files are worth reading whole.
 
+## Linux desktop and CLI
+
+| File | Purpose |
+|---|---|
+| `linux/parrot.py` | Explicit recording/device/transcription CLI, private XDG defaults and inference preflight |
+| `linux/capture.py` | PipeWire microphone/output-monitor capture into aligned local WAV tracks and manifest |
+| `linux/transcribe.py` | Manual two-profile inference, source-scoped speaker/word schema v2, legacy reads, atomic exports and complete-generation correction/Undo history |
+| `linux/review.py` | Local strict-JSON-schema model client, exact revision/phrase anchors, durable runs/decisions/playback and original-word excerpts |
+| `linux/desktop.py` | Private preferences/history, Archive/Restore, whole-recording OS Trash/Undo, independent capture and resident-model FIFO transcription controller |
+| `linux/gui.py` | Adaptive recording management, visible transcription queue, responsive unrelated-recording workflows, serial autosave, scoped recovery and playback lifecycle |
+| `linux/transcript.py` | Shared editable Thread/Timeline buffers, inline suspect underlines/review controls, Undo/Redo and per-entry Play/Stop |
+| `linux/playback.py` | Source-matched finite GStreamer WAV playback; one chunk at a time with Stop/EOS/error cleanup |
+| `linux/identity.py` | The Repeater display name, local application ID and selected icon source shared by GUI and installer |
+| `linux/assets/app-icon.png` | Installed 512px radio-and-mustache icon exported from the selected subtle logo concept |
+| `linux/assets/logo-concepts/` | Original 1024px logo alternatives; subtle radio selected, obvious trooper not installed |
+| `linux/install-desktop.py` | User-local The Repeater launcher and selected-icon installation, run before GUI startup |
+| `linux/setup.sh` | Dispatches explicit one/both-profile pinned local setup; no runtime/model fallback |
+| `linux/setup-parakeet.sh` | Builds isolated pinned transcribe.cpp CPU/CUDA/Vulkan provider and verifies the four-slot overlap bundle |
+| `linux/native-transcribe.c` | Native Multitalker Parakeet bridge with genuine word spans, stable whole-file tags and bounded source output |
+| `linux/setup-nemotron.sh` | Installs isolated frozen NeMo/Torch/Python and checksum-verified ASR/V3 checkpoints |
+| `linux/nemotron-transcribe.py` | Coupled eight-slot masked parallel ASR with RNNT word emissions, lexical punctuation bounds and explicit backend preflight |
+| `linux/linux.mk` | Linux syntax sanity, GUI/launcher, setup, recording and behavioral-test Make targets |
+| `linux/test-capture.py` | Behavioral checks for device selection, PCM alignment, processed-input routes and capture lifecycle |
+| `linux/test-transcribe.py` | Speaker/word/legacy boundaries, complete-generation Undo, venv selection, stale-save rejection and failure/cancellation rollback |
+| `linux/test-nemotron.py` | Unicode/byte-fallback emissions, missing alignment, delayed punctuation, late-tail bounds, checkpoint rejection and CLI failure preservation |
+| `linux/test-desktop.py` | Preferences/jobs, collection/whole-recording Trash/Undo, busy discovery and optional real public-audio inference smoke |
+| `linux/test-playback.py` | Actual GStreamer source/bounds/Stop checks using synthetic WAVs and a hardware-free verification sink |
+| `linux/test-review.py` | Exact/local-only HTTP boundaries, persisted decisions/Undo/staleness, cancellation/rollback and original-word excerpt mapping |
+| `docs/linux-port.md` | Linux prerequisites, GUI/CLI workflows, privacy, storage schema, verification and remaining port scope |
+| `docs/android-feasibility.md` | Source-backed Android/code-sharing options, note-taker prior art, platform limits and unverified device-spike proposals |
+
 ## Entry points & harnesses
 
 | File | L | Purpose |

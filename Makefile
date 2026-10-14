@@ -6,6 +6,10 @@
 #
 # Run `make` (or `make help`) for the target list.
 
+ifeq ($(shell uname -s),Linux)
+include linux/linux.mk
+else
+
 CONFIG      ?= release
 DIST        ?= dist
 APP         := $(DIST)/Parrot.app
@@ -251,3 +255,5 @@ xcode:
 .PHONY: clean
 clean:
 	rm -rf .build $(DIST)
+
+endif

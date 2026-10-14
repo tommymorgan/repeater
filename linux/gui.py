@@ -28,6 +28,7 @@ from desktop import (DesktopController, DesktopError, Preferences, list_meetings
 from transcribe import (render_exports, load_transcript_edit_state, save_transcript_edit_state,
                         edit_transcript_text, undo_transcript_edit, redo_transcript_edit,
                         rename_speaker, reassign_segment, confirm_segment, speaker_label,
+                        reject_segment, create_speaker_and_reassign,
                         PROFILE_DEFAULTS)
 from transcript import TranscriptPane
 from playback import SegmentPlayer, PlaybackError
@@ -130,9 +131,15 @@ class RepeaterWindow(Adw.ApplicationWindow):
         self.voice_hints = {}
         self.voice_generation = 0
         self.voice_offer_counts = {}
+        self.voice_offer_dialog = None
+        self.speaker_panel_open = False
+        self.speaker_open_id = None
+        self.speaker_rename_id = None
+        self.speaker_correction_index = None
         self.completed_session = None
-        self.last_job_state = 'idle'
-        self.last_operation = 'capture'
+        self.refresh_transcripts = set()
+        self.last_snapshot = None
+        self.shutdown_complete = False
         self.settings_page = None
         self.autosave_source = 0
         self.save_inflight = False
@@ -182,8 +189,15 @@ class RepeaterWindow(Adw.ApplicationWindow):
         self.add_breakpoint(breakpoint)
         sidebar = Adw.ToolbarView()
         sidebar_header = Adw.HeaderBar(show_end_title_buttons=False)
-        sidebar_header.set_title_widget(Gtk.Label(label='Recordings'))
-        sidebar_header.pack_end(button('Refresh history', lambda *_: self.refresh_history(), 'view-refresh-symbolic'))
+        self.sidebar_title = Gtk.Label(label='Recordings')
+        self.sidebar_heading = Gtk.Stack()
+        self.sidebar_heading.add_named(self.sidebar_title, 'title')
+        self.speaker_back = button('Back to Recordings', lambda *_: self._close_speakers())
+        self.speaker_back.set_child(Adw.ButtonContent(icon_name='go-previous-symbolic', label='Back to Recordings'))
+        self.sidebar_heading.add_named(self.speaker_back, 'back')
+        sidebar_header.set_title_widget(self.sidebar_heading)
+        self.history_refresh = button('Refresh history', lambda *_: self.refresh_history(), 'view-refresh-symbolic')
+        sidebar_header.pack_end(self.history_refresh)
         sidebar.add_top_bar(sidebar_header)
         history_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         history_box.set_margin_top(12)
@@ -211,7 +225,14 @@ class RepeaterWindow(Adw.ApplicationWindow):
         scroller = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
         scroller.set_child(self.history_list)
         history_box.append(scroller)
-        sidebar.set_content(history_box)
+        self.sidebar_stack = Gtk.Stack(vexpand=True)
+        self.sidebar_stack.add_named(history_box, 'recordings')
+        self.speaker_scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        self.speaker_cards = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
+                                     margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+        self.speaker_scroll.set_child(self.speaker_cards)
+        self.sidebar_stack.add_named(self.speaker_scroll, 'speakers')
+        sidebar.set_content(self.sidebar_stack)
         self.sidebar_page = Adw.NavigationPage.new(sidebar, 'Recordings')
         self.sidebar_page.set_size_request(270, -1)
         self.paned.set_start_child(self.sidebar_page)
@@ -382,7 +403,7 @@ class RepeaterWindow(Adw.ApplicationWindow):
 
     def _play_segment(self, source, start, end, key):
         meeting = self.selected_meeting
-        if not meeting or self._busy():
+        if not meeting or self._session_busy():
             return
         if self.player.active_key == key:
             self._stop_playback()
@@ -420,8 +441,37 @@ class RepeaterWindow(Adw.ApplicationWindow):
                 self.record_errors.pop(path, None)
                 self._show_record_error()
 
-    def _busy(self):
-        return self.pending_action or self.review_scanning or self.closing or self.controller.snapshot.state not in ('idle', 'error')
+    def _session_protected(self, path):
+        snapshot = self.controller.snapshot
+        return (path in snapshot.queued_sessions
+                or (snapshot.transcription_state == 'transcribing' and path == snapshot.transcription_session)
+                or (snapshot.state not in ('idle', 'error') and path == snapshot.session))
+
+    def _session_busy(self):
+        return (self.pending_action or self.review_scanning or self.closing
+                or (self.selected_meeting is not None and self._session_protected(self.selected_meeting.path)))
+
+    def _lanes_finished(self):
+        snapshot = self.controller.snapshot
+        return (snapshot.state in ('idle', 'error')
+                and snapshot.transcription_state in ('idle', 'error') and not snapshot.queued_sessions)
+
+    def _history_job_subtitles(self):
+        snapshot = self.controller.snapshot
+        row = self.history_list.get_first_child()
+        while row:
+            if hasattr(row, 'meeting'):
+                path = row.meeting.path
+                if snapshot.transcription_state == 'transcribing' and path == snapshot.transcription_session:
+                    status = 'Transcribing locally'
+                elif path in snapshot.queued_sessions:
+                    status = f'Queued #{snapshot.queued_sessions.index(path) + 1}'
+                elif snapshot.state not in ('idle', 'error') and path == snapshot.session:
+                    status = 'Recording' if snapshot.state == 'recording' else 'Finalizing audio' if snapshot.state == 'stopping' else 'Starting recording'
+                else:
+                    status = ''
+                row.metadata.set_text(f'{row.metadata_text} · {status}' if status else row.metadata_text)
+            row = row.get_next_sibling()
 
     def _review_current(self, path, generation):
         return (not self.closing and self.review_mode and self.selected_meeting is not None
@@ -447,7 +497,7 @@ class RepeaterWindow(Adw.ApplicationWindow):
             self._leave_review()
             self._update_controls()
             return
-        if self._busy() or not self.selected_meeting or not self.transcript_view.has_speech:
+        if self._session_busy() or not self.selected_meeting or not self.transcript_view.has_speech:
             return
         path = self.selected_meeting.path
         def enter():
@@ -482,7 +532,7 @@ class RepeaterWindow(Adw.ApplicationWindow):
         self._show_record_error()
 
     def _scan_review(self):
-        if self._busy() or not self.review_mode or not self.selected_meeting:
+        if self._session_busy() or not self.review_mode or not self.selected_meeting:
             return
         path = self.selected_meeting.path
         def scan():
@@ -522,7 +572,7 @@ class RepeaterWindow(Adw.ApplicationWindow):
             finding['playing_excerpt'] = self.player.active_key == ('review', finding['id'], False)
             finding['playing_context'] = self.player.active_key == ('review', finding['id'], True)
         self.transcript_view.set_review(findings, self._review_decision, self._review_play,
-                                        enabled=not self._busy())
+                                        enabled=not self._session_busy())
         self.review_status.set_visible(not (self.review_mode and self.review_error))
         self.review_again.get_parent().set_visible('review' not in self.recovery_actions)
         if self.review_mode and self.review_error:
@@ -533,7 +583,7 @@ class RepeaterWindow(Adw.ApplicationWindow):
                                         if findings else 'No active findings. Run review again to scan this transcript.')
 
     def _review_decision(self, finding_id, decision):
-        if self._busy() or not self.review_mode or not self.selected_meeting:
+        if self._session_busy() or not self.review_mode or not self.selected_meeting:
             return
         path, generation = self.selected_meeting.path, self.review_generation
         def decide():
@@ -558,7 +608,7 @@ class RepeaterWindow(Adw.ApplicationWindow):
         self._after_edits(decide)
 
     def _review_play(self, finding, whole_clip=False):
-        if self._busy() or not self.selected_meeting:
+        if self._session_busy() or not self.selected_meeting:
             return
         key = ('review', finding['id'], whole_clip)
         if self.player.active_key == key:
@@ -659,10 +709,12 @@ class RepeaterWindow(Adw.ApplicationWindow):
         self.transcript_view.set_transcript(state.payload, render_exports(state.payload)['transcript.txt'])
         self.transcript_view.set_history(state)
         self._render_review()
+        if self.speaker_rename_id is None:
+            self._render_speakers()
 
     def _edit_text(self, index, text):
         meeting = self.selected_meeting
-        if not meeting or self._busy() or meeting.path not in self.edit_states:
+        if not meeting or self._session_busy() or meeting.path not in self.edit_states:
             return
         now = time.monotonic()
         new_group = self.last_edit is None or self.last_edit[0] != (meeting.path, index) or now - self.last_edit[1] > 1
@@ -690,7 +742,7 @@ class RepeaterWindow(Adw.ApplicationWindow):
         self._history_edit(redo_transcript_edit)
 
     def _history_edit(self, reducer):
-        if not self.selected_meeting or self._busy():
+        if not self.selected_meeting or self._session_busy():
             return
         path = self.selected_meeting.path
         state = self.edit_states.get(path)
@@ -768,10 +820,10 @@ class RepeaterWindow(Adw.ApplicationWindow):
         self._stop_playback()
         meeting = self.selected_meeting
         self.more_button.popdown()
-        if not meeting or self._busy():
+        if not meeting or self._session_busy():
             return
         def archive():
-            if self._busy() or self.selected_meeting is None or self.selected_meeting.path != meeting.path:
+            if self._session_busy() or self.selected_meeting is None or self.selected_meeting.path != meeting.path:
                 return
             self.pending_action = True
             self._update_controls()
@@ -789,7 +841,7 @@ class RepeaterWindow(Adw.ApplicationWindow):
         self._stop_playback()
         meeting = self.selected_meeting
         self.more_button.popdown()
-        if not meeting or self._busy():
+        if not meeting or self._session_busy():
             return
         dialog = Adw.AlertDialog(heading=f'Move “{meeting.title}” to Trash?',
                                 body=f'This moves the whole recording, audio and all transcript exports out of {"Archived" if meeting.archived else "Active"}. Undo restores the whole recording to its original collection.')
@@ -804,7 +856,7 @@ class RepeaterWindow(Adw.ApplicationWindow):
     def _trash_confirmed(self, meeting):
         self._stop_playback()
         def trash():
-            if self._busy() or self.selected_meeting is None or self.selected_meeting.path != meeting.path:
+            if self._session_busy() or self.selected_meeting is None or self.selected_meeting.path != meeting.path:
                 return
             self.pending_action = True
             self._update_controls()
@@ -828,7 +880,7 @@ class RepeaterWindow(Adw.ApplicationWindow):
 
     def _restore_trash(self, entry, meeting):
         def restore():
-            if self._busy():
+            if self.pending_action or self.closing or self._session_protected(entry.original_path):
                 self.show_error('Stop the active job before restoring this recording from Trash.')
                 retry = Adw.Toast.new('Recording remains in Trash')
                 retry.set_button_label('Retry Undo')
@@ -1096,6 +1148,8 @@ class RepeaterWindow(Adw.ApplicationWindow):
             metadata.add_css_class('caption')
             metadata.add_css_class('dim-label')
             content.append(metadata)
+            row.metadata = metadata
+            row.metadata_text = metadata.get_text()
             row.set_child(content)
             self.history_list.append(row)
             if meeting.path == selected_path:
@@ -1108,8 +1162,11 @@ class RepeaterWindow(Adw.ApplicationWindow):
             self.history_list.select_row(selected_row)
         self.refreshing_history = False
         if selected_row:
-            self._select_meeting(selected_row.meeting, navigate=False,
-                                 force=selected_row.meeting.path == completed)
+            self._select_meeting(selected_row.meeting,
+                                 navigate=selected_row.meeting.path == completed and self.settings_page is None,
+                                 force=selected_row.meeting.path == completed or selected_row.meeting.path in self.refresh_transcripts)
+        self.refresh_transcripts.difference_update(meeting.path for meeting in meetings)
+        self._history_job_subtitles()
         if not visible and self.selected_meeting is not None:
             self._leave_review()
             self.selected_meeting = None
@@ -1133,6 +1190,8 @@ class RepeaterWindow(Adw.ApplicationWindow):
                      and previous.has_transcript == meeting.has_transcript
                      and previous.status == meeting.status and previous.error == meeting.error)
         if previous is None or previous.path != meeting.path or force:
+            self._close_speakers()
+            self.speaker_open_id = None
             self._leave_review()
             self._stop_playback()
         self.selected_meeting = meeting
@@ -1142,8 +1201,7 @@ class RepeaterWindow(Adw.ApplicationWindow):
         if navigate:
             self.split.set_show_content(True)
             self.stack.set_visible_child_name('detail')
-        elif self.settings_page is None and force:
-            self.stack.set_visible_child_name('detail')
+
         self.meeting_title.set_text(meeting.title)
         self.meeting_title.set_tooltip_text(meeting.title)
         metadata = f'{meeting.started_at[:16].replace("T", " ")} · {duration(meeting.duration_seconds)}'
@@ -1190,69 +1248,239 @@ class RepeaterWindow(Adw.ApplicationWindow):
 
     # ---- voice learning: confirmation-gated enrollment and tiered matching ----
 
+    def _open_speakers(self, index=None):
+        meeting = self.selected_meeting
+        state = self.edit_states.get(meeting.path) if meeting else None
+        if state is None or state.payload.get('schemaVersion') != 2:
+            return
+        if index is not None:
+            self.speaker_open_id = state.payload['segments'][index].get('speakerId')
+            self.speaker_rename_id = None
+            self.speaker_correction_index = None
+        self.speaker_panel_open = True
+        self.sidebar_stack.set_visible_child_name('speakers')
+        self.sidebar_heading.set_visible_child_name('back')
+        self.sidebar_page.set_title('Speakers')
+        self.history_refresh.set_visible(False)
+        self._render_speakers()
+        if self.layout.get_visible_child_name() == 'compact':
+            self.split.set_show_content(False)
+        if index is not None:
+            control = self.speaker_rename_buttons.get(self.speaker_open_id)
+            if control:
+                control.grab_focus()
+
+    def _close_speakers(self):
+        self.speaker_panel_open = False
+        self.speaker_rename_id = None
+        self.speaker_correction_index = None
+        self.sidebar_stack.set_visible_child_name('recordings')
+        self.sidebar_title.set_label('Recordings')
+        self.sidebar_page.set_title('Recordings')
+        self.sidebar_heading.set_visible_child_name('title')
+        self.history_refresh.set_visible(True)
+
+    def _begin_speaker_rename(self, speaker_id):
+        self.speaker_rename_id = speaker_id
+        self.speaker_correction_index = None
+        self._render_speakers()
+        self.speaker_name_entry.grab_focus()
+        self.speaker_name_entry.select_region(0, -1)
+
+    def _cancel_speaker_form(self):
+        self.speaker_rename_id = None
+        self.speaker_correction_index = None
+        self._render_speakers()
+
+    def _apply_speaker_name(self, speaker_id, entry, error_label):
+        meeting = self.selected_meeting
+        if not meeting or self._session_busy():
+            return
+        try:
+            state = rename_speaker(self.edit_states[meeting.path], speaker_id, entry.get_text())
+        except Exception as error:
+            error_label.set_label(str(error))
+            return
+        self.speaker_rename_id = None
+        self._changed_edit_state(meeting.path, state)
+
+    def _render_speakers(self):
+        if not self.speaker_panel_open:
+            return
+        meeting = self.selected_meeting
+        state = self.edit_states.get(meeting.path) if meeting else None
+        if state is None:
+            self._close_speakers()
+            return
+        payload = state.payload
+        self.speaker_panel_generation = getattr(self, 'speaker_panel_generation', 0) + 1
+        generation = self.speaker_panel_generation
+        while child := self.speaker_cards.get_first_child():
+            self.speaker_cards.remove(child)
+        self.speaker_rename_buttons = {}
+        self.speaker_occurrences = {}
+        self.speaker_cards.append(label('Speakers', 'title-3'))
+        self.speaker_cards.append(label('Names apply to this recording. Me/Them are audio tracks.', 'dim-label'))
+        groups = {}
+        for index, segment in enumerate(payload['segments']):
+            groups.setdefault(segment.get('speakerId'), []).append((index, segment))
+        for speaker in payload['speakers']:
+            speaker_id = speaker['id']
+            turns = groups.get(speaker_id, [])
+            name = speaker.get('name') or speaker['label']
+            card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                           margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+            frame = Adw.Bin(child=card, css_classes=['card'])
+            caption = name if speaker.get('name') else f'{name} ({speaker["source"].title()})'
+            card.append(label(caption, 'heading'))
+            confirmed = sum(segment.get('speakerConfirmed') == speaker_id for _, segment in turns)
+            card.append(label(f'{len(turns)} snippets · {confirmed} confirmed', 'dim-label'))
+            actions = Gtk.Box(spacing=6)
+            rename = button('Rename all', lambda *_, sid=speaker_id: self._begin_speaker_rename(sid))
+            rename.set_sensitive(not self._session_busy())
+            actions.append(rename)
+            self.speaker_rename_buttons[speaker_id] = rename
+            profile = self.voices.profile_for_name(name, speaker['source'])
+            if profile:
+                forget = button('Forget voice', lambda *_, pid=profile.id: self._forget_voice(pid))
+                actions.append(forget)
+                card.append(label(f'Remembered · {len(profile.samples)} voice samples', 'dim-label'))
+            card.append(actions)
+            if self.speaker_rename_id == speaker_id:
+                card.append(label(f'New name for all {len(turns)} snippets'))
+                entry = Gtk.Entry(text=name, max_length=60, hexpand=True)
+                self.speaker_name_entry = entry
+                card.append(entry)
+                error = label('', 'error')
+                card.append(error)
+                row = Gtk.Box(spacing=6)
+                row.append(button('Apply', lambda *_, sid=speaker_id, e=entry, err=error: self._apply_speaker_name(sid, e, err)))
+                row.append(button('Cancel', lambda *_: self._cancel_speaker_form()))
+                card.append(row)
+                card.append(label('Audio, timing and playback stay unchanged.', 'dim-label'))
+            hint = self.voice_hints.get(speaker_id)
+            if hint:
+                card.append(label(f'Voice match: {hint["name"]} ({hint["score"]:.2f})', 'dim-label'))
+            occurrences = Gtk.Expander(label=f'{len(turns)} snippets')
+            listing = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16, margin_top=8)
+            occurrences.set_child(listing)
+            self.speaker_occurrences[speaker_id] = occurrences
+            def expanded(widget, _param=None, rows=turns, column=listing):
+                if not widget.get_expanded() or column.get_first_child():
+                    return
+                remaining = iter(rows)
+                def pump():
+                    if generation != self.speaker_panel_generation or not self.speaker_panel_open:
+                        return GLib.SOURCE_REMOVE
+                    for _ in range(12):
+                        item = next(remaining, None)
+                        if item is None:
+                            return GLib.SOURCE_REMOVE
+                        self._append_speaker_occurrence(column, payload, *item)
+                    return GLib.SOURCE_CONTINUE
+                if pump() == GLib.SOURCE_CONTINUE:
+                    GLib.idle_add(pump)
+            occurrences.connect('notify::expanded', expanded)
+            card.append(occurrences)
+            self.speaker_cards.append(frame)
+            occurrences.set_expanded(speaker_id == self.speaker_open_id)
+
+    def _append_speaker_occurrence(self, column, payload, index, segment):
+        row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        row.append(label(f'{duration(segment["startTime"])}–{duration(segment["endTime"])}', 'dim-label'))
+        excerpt = label(' '.join(segment['text'].split()))
+        excerpt.set_lines(3)
+        excerpt.set_ellipsize(Pango.EllipsizeMode.END)
+        row.append(excerpt)
+        feedback = ('Confirmed' if segment.get('speakerConfirmed') else
+                    'Marked Wrong · needs correction' if segment.get('speakerRejected') else 'Not reviewed')
+        row.append(label(feedback, 'dim-label'))
+        actions = Gtk.Box(spacing=6)
+        for caption, kind in (('✓ Right', 'confirm'), ('✕ Wrong', 'wrong'), ('Show', 'show')):
+            control = button(caption, lambda *_, action=kind, i=index: self._speaker_action(action, i, None))
+            control.set_sensitive(kind == 'show' or not self._session_busy())
+            actions.append(control)
+        row.append(actions)
+        if self.speaker_correction_index == index:
+            row.append(label('Who said this?', 'heading'))
+            row.append(label(segment['text']))
+            for speaker in payload['speakers']:
+                if speaker['source'] == segment['source'] and speaker['id'] != segment.get('speakerId'):
+                    row.append(button(speaker.get('name') or speaker['label'],
+                                      lambda *_, sid=speaker['id'], i=index: self._speaker_action('reassign', i, sid)))
+            new_person = Gtk.Expander(label='New person')
+            form = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            entry = Gtk.Entry(placeholder_text='Name', max_length=60)
+            form.append(entry)
+            error = label('', 'error')
+            form.append(error)
+            def create(*_):
+                if not entry.get_text().strip():
+                    error.set_label('Enter a name.')
+                    return
+                self._speaker_action('create', index, entry.get_text())
+            form.append(button('Create person and apply', create))
+            new_person.set_child(form)
+            row.append(new_person)
+            row.append(button('Cancel', lambda *_: self._cancel_speaker_form()))
+        column.append(row)
+
+    def _forget_voice(self, profile_id):
+        meeting = self.selected_meeting
+        self._run(lambda: self.voices.forget(profile_id), lambda _: self._render_speakers(),
+                  lambda error: self._record_error(meeting.path, 'voice', error))
+
     def _speaker_action(self, kind, index, value):
         meeting = self.selected_meeting
         if not meeting or meeting.path not in self.edit_states:
             return
+        if kind == 'open':
+            self._open_speakers(index)
+            return
+        if kind == 'show':
+            self.split.set_show_content(True)
+            self.transcript_view.show_segment(index)
+            return
+        if self._session_busy():
+            return
         state = self.edit_states[meeting.path]
+        before = state.payload['segments'][index]
+        newly_confirmed = kind == 'confirm' and before.get('speakerConfirmed') != before.get('speakerId')
         try:
             if kind == 'confirm':
-                confirmed = state.payload['segments'][index].get('speakerConfirmed') is not None
-                state = confirm_segment(state, index, not confirmed)
-                if not confirmed:
-                    self._maybe_offer_enrollment(state.payload, index)
-            elif kind == 'reassign':
-                before = state.payload['segments'][index]
+                state = confirm_segment(state, index)
+                self.speaker_correction_index = None
+            elif kind == 'wrong':
+                state = reject_segment(state, index)
                 hint = self.voice_hints.get(before.get('speakerId'))
-                if hint and before.get('speakerConfirmed'):
+                if hint and hint['tier'] == 'auto' and not before.get('speakerRejected'):
                     self._run(lambda: self.voices.record_wrong_auto(hint['profileId']), lambda _: None,
                               lambda error: self._record_error(meeting.path, 'voice', error))
+                self.speaker_rename_id = None
+                self.speaker_correction_index = index
+            elif kind == 'reassign':
                 state = reassign_segment(state, index, value)
-            elif kind == 'rename':
-                self._ask_speaker_name(state, index)
-                return
-            elif kind == 'hint-yes':
-                state = confirm_segment(state, index)
-            elif kind == 'hint-no':
-                self._run(lambda: self.voices.record_wrong_auto(value), lambda _: None,
-                          lambda error: self._record_error(meeting.path, 'voice', error))
-                self.voice_hints.pop(state.payload['segments'][index].get('speakerId'), None)
+                self.speaker_correction_index = None
+            elif kind == 'create':
+                state = create_speaker_and_reassign(state, index, value)
+                self.speaker_correction_index = None
+            else:
                 return
         except Exception as error:
             self._record_error(meeting.path, 'save', error)
             return
-        if kind == 'hint-yes':
+        self.speaker_open_id = state.payload['segments'][index].get('speakerId')
+        if state != self.edit_states[meeting.path]:
+            self._changed_edit_state(meeting.path, state)
+        else:
+            self._render_speakers()
+        if newly_confirmed:
             self._maybe_offer_enrollment(state.payload, index)
-        self._changed_edit_state(meeting.path, state)
 
-    def _ask_speaker_name(self, state, index):
-        segment = state.payload['segments'][index]
-        speaker = next((entry for entry in state.payload['speakers']
-                        if entry['id'] == segment.get('speakerId')), None)
-        if speaker is None:
-            return
-        current = speaker.get('name') or speaker['label']
-        entry = Gtk.Entry(text=current, max_length=60, hexpand=True)
-        dialog = Adw.AlertDialog(heading='Name this speaker',
-                                 body='Applies to every snippet this voice said in this recording.')
-        dialog.set_extra_child(entry)
-        dialog.add_response('cancel', 'Cancel')
-        dialog.add_response('rename', 'Rename')
-        dialog.set_default_response('rename')
-        dialog.set_close_response('cancel')
-        def responded(_dialog, response, speaker_id=speaker['id'], meeting=self.selected_meeting):
-            if response != 'rename':
-                return
-            try:
-                new_state = rename_speaker(self.edit_states[meeting.path], speaker_id, entry.get_text())
-            except Exception as error:
-                self._record_error(meeting.path, 'save', error)
-                return
-            self._changed_edit_state(meeting.path, new_state)
-        dialog.connect('response', responded)
-        dialog.present(self)
 
     def _maybe_offer_enrollment(self, payload, index):
+        if self.voice_offer_dialog is not None:
+            return
         segment = payload['segments'][index]
         speaker = next((entry for entry in payload['speakers']
                         if entry['id'] == segment.get('speakerId')), None)
@@ -1261,34 +1489,48 @@ class RepeaterWindow(Adw.ApplicationWindow):
         name = speaker.get('name') or speaker['label']
         if self.voices.profile_for_name(name, speaker['source']):
             return
-        key = (segment['source'], speaker['id'])
-        self.voice_offer_counts[key] = self.voice_offer_counts.get(key, 0) + 1
-        if self.voice_offer_counts[key] > 1:
+        meeting = self.selected_meeting
+        key = (meeting.path, payload['generation']['id'], speaker['id'])
+        confirmed = sum(s.get('speakerConfirmed') == speaker['id'] for s in payload['segments'])
+        if confirmed <= self.voice_offer_counts.get(key, 0):
             return
+        self.voice_offer_counts[key] = confirmed
         dialog = Adw.AlertDialog(heading=f'Remember {name}’s voice?',
-                                 body='Only snippets you confirm with ✓ enroll. Voice profiles stay on this computer; forget anytime in Settings.')
+                                 body='Only snippets you confirm with ✓ Right. Stays on this computer; forget anytime.')
+        self.voice_offer_dialog = dialog
         dialog.add_response('not-now', 'Not now')
         dialog.add_response('remember', 'Remember voice')
         dialog.set_response_appearance('remember', Adw.ResponseAppearance.SUGGESTED)
         dialog.set_default_response('remember')
         dialog.set_close_response('not-now')
-        meeting = self.selected_meeting
         def responded(_dialog, response):
+            self.voice_offer_dialog = None
             if response == 'remember':
-                self._enroll_segment(meeting, payload, index, name, speaker['source'])
+                current = self.edit_states.get(meeting.path)
+                if current and current.payload['generation']['id'] == payload['generation']['id']:
+                    self._enroll_speaker(meeting, current.payload, speaker['id'], name, speaker['source'])
         dialog.connect('response', responded)
         dialog.present(self)
 
-    def _enroll_segment(self, meeting, payload, index, name, source):
-        segment = payload['segments'][index]
-        manifest = json.loads((meeting.path / 'session.json').read_text())
+    def _enroll_speaker(self, meeting, payload, speaker_id, name, source):
+        indices = [index for index, segment in enumerate(payload['segments'])
+                   if segment.get('speakerConfirmed') == speaker_id]
         def enroll():
-            windows = windows_for_segment(segment, manifest['durationSeconds'])
-            vectors = embed_windows(meeting.path, windows)
-            return self.voices.enroll(name, source, manifest['id'], index, vectors)
-        def done(_profile_id):
-            self._queue_voice_match(self.edit_states[meeting.path])
+            manifest = json.loads((meeting.path / 'session.json').read_text())
+            profile = self.voices.profile_for_name(name, source)
+            enrolled = {sample['segmentIndex'] for sample in profile.samples
+                        if sample['meetingId'] == manifest['id']} if profile else set()
+            for index in indices:
+                if index not in enrolled:
+                    windows = windows_for_segment(payload['segments'][index], manifest['durationSeconds'])
+                    vectors = embed_windows(meeting.path, windows)
+                    self.voices.enroll(name, source, manifest['id'], index, vectors)
+        def done(_):
+            if self.selected_meeting and self.selected_meeting.path == meeting.path:
+                self._queue_voice_match(self.edit_states[meeting.path])
+                self._render_speakers()
         self._run(enroll, done, lambda error: self._record_error(meeting.path, 'voice', error))
+
 
     def _queue_voice_match(self, state):
         meeting = self.selected_meeting
@@ -1386,6 +1628,8 @@ class RepeaterWindow(Adw.ApplicationWindow):
     def _show_recorder(self):
         if self.settings_page:
             self.navigation.pop()
+        self._close_speakers()
+        self.speaker_open_id = None
         self._leave_review()
         self.selected_meeting = None
         self.error_card.set_visible(False)
@@ -1408,8 +1652,9 @@ class RepeaterWindow(Adw.ApplicationWindow):
         return False
 
     def _begin(self, work, *, kind='capture', session=None):
-        if self.pending_action or self.controller.snapshot.state not in ('idle', 'error'):
+        if self.pending_action or self.closing or (kind == 'capture' and self.controller.snapshot.state not in ('idle', 'error')):
             return
+
         self.show_error('')
         self.pending_action = True
         self._update_controls()
@@ -1443,7 +1688,7 @@ class RepeaterWindow(Adw.ApplicationWindow):
     def transcribe_selected(self):
         self._stop_playback()
         meeting = self.selected_meeting
-        if not meeting or meeting.status != 'recorded' or self._busy() or not self._can_transcribe():
+        if not meeting or meeting.status != 'recorded' or self._session_busy() or self.review_write_active or self.review_writes or not self._can_transcribe():
             return
         state = self.edit_states.get(meeting.path)
         if state and state.has_corrections:
@@ -1460,7 +1705,7 @@ class RepeaterWindow(Adw.ApplicationWindow):
 
     def _transcribe_meeting(self, meeting):
         def begin():
-            if self._busy() or not self._can_transcribe() or not self.selected_meeting or self.selected_meeting.path != meeting.path or meeting.status != 'recorded':
+            if self._session_busy() or self.review_write_active or self.review_writes or not self._can_transcribe() or not self.selected_meeting or self.selected_meeting.path != meeting.path or meeting.status != 'recorded':
                 return
             if not self._flush_settings():
                 return
@@ -1475,41 +1720,52 @@ class RepeaterWindow(Adw.ApplicationWindow):
         GLib.idle_add(self._apply_snapshot, snapshot)
 
     def _apply_snapshot(self, snapshot):
-        if snapshot.state in ('idle', 'error') and self.last_job_state not in ('idle', 'error'):
-            self.completed_session = snapshot.session
-        if snapshot.state in ('starting', 'recording', 'stopping'):
-            self.last_operation = 'capture'
-        elif snapshot.state == 'transcribing':
-            self.last_operation = 'transcribe'
-        self.last_job_state = snapshot.state
-        self._update_controls()
+        previous = self.last_snapshot
+        self.last_snapshot = snapshot
+        capture_finished = (previous is not None and previous.state not in ('idle', 'error')
+                            and snapshot.state in ('idle', 'error'))
+        transcription_finished = (previous is not None and previous.transcription_state == 'transcribing'
+                                  and (snapshot.transcription_state != 'transcribing'
+                                       or snapshot.transcription_session != previous.transcription_session))
+        if capture_finished:
+            self.completed_session = snapshot.session if self.selected_meeting is None else None
+        if transcription_finished:
+            self.refresh_transcripts.add(previous.transcription_session)
+            if previous.transcription_session not in self.edit_dirty:
+                self.edit_states.pop(previous.transcription_session, None)
         if snapshot.error:
             if snapshot.session:
-                kind = 'capture' if self.last_operation == 'capture' else 'transcribe'
-                self._record_error(snapshot.session, kind, snapshot.error)
+                self._record_error(snapshot.session, 'capture', snapshot.error)
             elif not self.selected_meeting:
                 self.show_error(snapshot.error)
-        if snapshot.state in ('starting', 'recording', 'stopping') and self.settings_page is None:
+        if snapshot.transcription_error and snapshot.transcription_session:
+            self._record_error(snapshot.transcription_session, 'transcribe', snapshot.transcription_error)
+        capture_started = (snapshot.state == 'starting' and (previous is None or previous.state != 'starting'))
+        if capture_started and self.settings_page is None:
             self.stack.set_visible_child_name('recorder')
             self.split.set_show_content(True)
-        if snapshot.state in ('idle', 'error'):
+        self._update_controls()
+        self._history_job_subtitles()
+        if capture_finished or transcription_finished or (previous is None):
             self.refresh_history()
-            if self.closing and not self.save_inflight and self.save_pending is None:
-                self.get_application().quit()
+        if (self.closing and self.shutdown_complete and self._lanes_finished()
+                and not self.save_inflight and self.save_pending is None):
+            self.get_application().quit()
         self._tick()
-        self.detail_job_label.set_text(self.job_label.get_text() if snapshot.state not in ('idle', 'error') else '')
         return False
 
     def _update_controls(self):
-        state = self.controller.snapshot.state
-        busy = self.pending_action or state not in ('idle', 'error') or self.closing or self.review_scanning
-        self.record_button.set_sensitive(not busy and bool(self.devices['microphones']) and bool(self.devices['outputs']))
+        snapshot = self.controller.snapshot
+        state = snapshot.state
+        busy = self._session_busy()
+        capture_busy = self.pending_action or state not in ('idle', 'error') or self.closing
+        self.record_button.set_sensitive(not capture_busy and bool(self.devices['microphones']) and bool(self.devices['outputs']))
         self.record_button.set_visible(state not in ('starting', 'recording', 'stopping'))
         self.stop_button.set_visible(state in ('starting', 'recording', 'stopping'))
         self.stop_button.set_sensitive(state in ('starting', 'recording') and not self.closing)
         for widget in (self.title_row, self.microphone_row, self.system_row, self.auto_row, self.refresh_devices_button):
-            widget.set_sensitive(not busy)
-        inference_allowed = not busy and self._can_transcribe() and self.selected_meeting is not None and self.selected_meeting.status == 'recorded'
+            widget.set_sensitive(not capture_busy)
+        inference_allowed = not busy and not self.review_write_active and not self.review_writes and self._can_transcribe() and self.selected_meeting is not None and self.selected_meeting.status == 'recorded'
         self.transcribe_button.set_sensitive(inference_allowed)
         for kind, widget in self.recovery_actions.items():
             allowed = inference_allowed if kind == 'transcribe' else not busy
@@ -1521,8 +1777,8 @@ class RepeaterWindow(Adw.ApplicationWindow):
         self.more_button.set_sensitive(not busy and self.selected_meeting is not None)
         self.archive_button.set_sensitive(not busy)
         self.trash_button.set_sensitive(not busy)
-        self.active_collection.set_sensitive(not busy)
-        self.archived_collection.set_sensitive(not busy)
+        self.active_collection.set_sensitive(not self.closing)
+        self.archived_collection.set_sensitive(not self.closing)
         self.transcript_view.set_history(self.edit_states.get(self.selected_meeting.path) if self.selected_meeting else None)
         self.transcript_view.set_editable(not busy and not self.transcript_loading)
         self.transcript_view.set_playback_enabled(not busy and not self.transcript_loading)
@@ -1530,7 +1786,7 @@ class RepeaterWindow(Adw.ApplicationWindow):
                                            and 'transcribe' not in self.recovery_actions)
         self.copy_button.set_sensitive(self.transcript_view.has_speech)
         self.folder_button.set_sensitive(self.selected_meeting is not None)
-        self.history_list.set_sensitive(not busy)
+        self.history_list.set_sensitive(not self.closing)
         self.review_button.set_sensitive(self.review_mode or (not busy and self.transcript_view.has_speech))
         self.review_again.set_sensitive(not busy)
         self._render_review()
@@ -1539,12 +1795,13 @@ class RepeaterWindow(Adw.ApplicationWindow):
             self.settings_stop_button.set_sensitive(state in ('starting', 'recording') and not self.closing)
 
             for widget in (*self.settings_fields.values(), *self.review_settings_fields):
-                widget.set_sensitive(not busy)
-        if busy:
+                widget.set_sensitive(not self.closing)
+        active = not self._lanes_finished() or self.pending_action or self.closing
+        if active:
             self.spinner.start()
         else:
             self.spinner.stop()
-        self.spinner.set_visible(busy)
+        self.spinner.set_visible(active)
 
     def _tick(self):
         if self.closing:
@@ -1553,13 +1810,22 @@ class RepeaterWindow(Adw.ApplicationWindow):
             snapshot = self.controller.snapshot
             state = snapshot.state
             if state == 'recording' and snapshot.started_at is not None:
-                self.job_label.set_text(f'Recording · {duration(time.monotonic() - snapshot.started_at)}')
+                capture = f'Recording · {duration(time.monotonic() - snapshot.started_at)}'
             else:
-                self.job_label.set_text({'idle': '', 'starting': 'Starting recording…',
-                                         'stopping': 'Finalizing audio…', 'transcribing': 'Transcribing locally…',
-                                         'error': ''}.get(state, state))
+                capture = {'starting': 'Starting recording…', 'stopping': 'Finalizing audio…'}.get(state, '')
+            jobs = []
+            if capture:
+                jobs.append(capture)
+            if snapshot.transcription_state == 'transcribing':
+                meeting = next((item for item in self.meetings if item.path == snapshot.transcription_session), None)
+                jobs.append(f'Transcribing locally: {meeting.title if meeting else snapshot.transcription_session.name}')
+            if snapshot.queued_sessions:
+                titles = {item.path: item.title for item in self.meetings}
+                jobs.append('Waiting: ' + '; '.join(f'{index}. {titles.get(path, path.name)}'
+                                                  for index, path in enumerate(snapshot.queued_sessions, 1)))
+            self.job_label.set_text(' · '.join(jobs))
         text = self.job_label.get_text()
-        active = self.closing or self.pending_action or self.controller.snapshot.state not in ('idle', 'error')
+        active = self.closing or self.pending_action or not self._lanes_finished()
         self.job_label.set_visible(active)
         self.detail_job_label.set_text(text if active else '')
         self.detail_job_label.set_visible(active)
@@ -1684,7 +1950,7 @@ class RepeaterWindow(Adw.ApplicationWindow):
                     self._check_inference()
             if self.save_pending is not None:
                 self._save_next()
-            elif not error and (self.close_after_save or self.closing) and self.controller.snapshot.state in ('idle', 'error'):
+            elif not error and (self.close_after_save or (self.closing and self.shutdown_complete)) and self._lanes_finished():
                 if self._flush_settings() and not self.save_inflight and self.save_pending is None:
                     self.get_application().quit()
         self._run(lambda: save_preferences(prefs), lambda _: finished(), finished)
@@ -1736,7 +2002,7 @@ class RepeaterWindow(Adw.ApplicationWindow):
             review_group.add(row)
             row.connect('changed', self._settings_changed)
         body.append(review_group)
-        self.voice_group_slot = Gtk.Stack()
+        self.voice_group_slot = Adw.Bin()
         self.voice_group_slot.set_child(self._voice_settings_group())
         body.append(self.voice_group_slot)
         message = label(self.error_label.get_text(), 'dim-label')
@@ -1793,7 +2059,7 @@ class RepeaterWindow(Adw.ApplicationWindow):
             return True
         if self.closing:
             return True
-        if self.controller.snapshot.state in ('idle', 'error') and not self.pending_action:
+        if self._lanes_finished() and not self.pending_action:
             if not self._flush_settings():
                 return True
             if self.preference_revision and self.preferences != self.saved_preferences:
@@ -1830,9 +2096,10 @@ class RepeaterWindow(Adw.ApplicationWindow):
         self.closing = True
         self._update_controls()
         self._tick()
-        self._run(self.controller.shutdown,
-                  lambda _: self._apply_snapshot(self.controller.snapshot),
-                  self._shutdown_failed)
+        def finished(_):
+            self.shutdown_complete = True
+            self._apply_snapshot(self.controller.snapshot)
+        self._run(self.controller.shutdown, finished, self._shutdown_failed)
 
     def _shutdown_failed(self, error):
         self.closing = False
@@ -1841,11 +2108,16 @@ class RepeaterWindow(Adw.ApplicationWindow):
 
 
 class RepeaterApplication(Adw.Application):
+    def _release_model(self, *_):
+        if self.window is not None:
+            self.window.controller.shutdown()
+
     def __init__(self):
         GLib.set_application_name(APP_NAME)
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
         Gtk.Window.set_default_icon_name(self.get_application_id())
         self.window = None
+        self.connect('shutdown', self._release_model)
         for name, callback in (('new', lambda *_: self.window.show_recorder()),
                                ('settings', lambda *_: self.window.show_settings()),
                                ('refresh', lambda *_: self.window.refresh_history()),

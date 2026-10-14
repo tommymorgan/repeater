@@ -38,6 +38,11 @@ Packages/
 *.sqlite-shm
 dist/
 
+# Linux Python caches and explicitly repo-local recording sessions
+__pycache__/
+*.py[cod]
+/linux/recordings/
+
 # Sparkle's private signing key must never be committed; it lives in the
 # login Keychain, with a backup in the user's password manager.
 *private-key*.txt

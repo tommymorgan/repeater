@@ -77,11 +77,14 @@ def _validate_v2(payload, duration):
     name = speaker.get('name')
     if name is not None and (not isinstance(name, str) or not 1 <= len(name.strip()) <= 60 or name != name.strip()):
       raise TranscriptionError('Speaker name must be trimmed text of 1 to 60 characters')
-    if (type(tag) is not int or not 1 <= tag <= capacity or speaker['id'] in registry or key in tags or
-        speaker.get('label') != f'Speaker {ordinal}'):
+    manual = speaker.get('origin') == 'manual'
+    if (speaker['id'] in registry or speaker.get('label') != f'Speaker {ordinal}' or
+        (manual and ('runtimeTag' not in speaker or tag is not None)) or
+        (not manual and (type(tag) is not int or not 1 <= tag <= capacity or key in tags))):
       raise TranscriptionError('Invalid, duplicated or over-capacity speaker registry entry')
     registry[speaker['id']] = speaker
-    tags.add(key)
+    if not manual:
+      tags.add(key)
   turns = payload.get('speakerTurns')
   if not isinstance(turns, list):
     raise TranscriptionError('Transcript needs separate acoustic speakerTurns')
@@ -94,10 +97,13 @@ def _validate_v2(payload, duration):
       raise TranscriptionError('Invalid acoustic speaker turn timing')
   for segment in payload['segments']:
     _validate_identity(segment, registry, segment['source'])
-    confirmed = segment.get('speakerConfirmed')
-    if confirmed is not None and (not isinstance(confirmed, str) or confirmed not in registry
-                                  or registry[confirmed]['source'] != segment['source']):
-      raise TranscriptionError('Speaker confirmation must reference a same-source speaker')
+    for field in ('speakerConfirmed', 'speakerRejected'):
+      feedback = segment.get(field)
+      if feedback is not None and (not isinstance(feedback, str) or feedback not in registry or
+          registry[feedback]['source'] != segment['source'] or feedback != segment.get('speakerId')):
+        raise TranscriptionError('Speaker feedback must reference the assigned same-source speaker')
+    if segment.get('speakerConfirmed') is not None and segment.get('speakerRejected') is not None:
+      raise TranscriptionError('Speaker cannot be both confirmed and rejected')
     if segment['text'] and segment['startTime'] >= segment['endTime']:
       raise TranscriptionError('Recognized text requires positive audio timing')
     for word in segment.get('words', []):
@@ -195,17 +201,26 @@ class TranscriptEditState:
               speaker.pop('name', None)
             else:
               speaker['name'] = operation['name']
-      elif operation['kind'] == 'reassign':
+      elif operation['kind'] in ('reassign', 'create-speaker'):
+        if operation['kind'] == 'create-speaker':
+          current['speakers'].append(copy.deepcopy(operation['speaker']))
         segment = current['segments'][operation['index']]
-        segment['speakerId'] = operation['speakerId']
+        segment['speakerId'] = (operation['speaker']['id'] if operation['kind'] == 'create-speaker'
+                                else operation['speakerId'])
         segment['speakerState'] = 'assigned'
         segment.pop('speakerConfirmed', None)
+        segment.pop('speakerRejected', None)
       elif operation['kind'] == 'confirm':
         segment = current['segments'][operation['index']]
         if operation['speakerId'] is None:
           segment.pop('speakerConfirmed', None)
         else:
           segment['speakerConfirmed'] = operation['speakerId']
+          segment.pop('speakerRejected', None)
+      elif operation['kind'] == 'reject':
+        segment = current['segments'][operation['index']]
+        segment['speakerRejected'] = operation['speakerId']
+        segment.pop('speakerConfirmed', None)
     return current, generated
 
   @property
@@ -280,8 +295,6 @@ def reassign_segment(state: TranscriptEditState, index: int, speaker_id: str) ->
     raise TranscriptionError('Choose an existing transcript segment')
   segment = current['segments'][index]
   _registry_speaker(current, speaker_id, source=segment['source'])
-  if segment['speakerId'] == speaker_id and segment.get('speakerConfirmed') == speaker_id:
-    return state
   return _speaker_operation(state, {'kind': 'reassign', 'index': index, 'speakerId': speaker_id})
 
 
@@ -301,6 +314,29 @@ def confirm_segment(state: TranscriptEditState, index: int, confirmed: bool = Tr
     return state
   return _speaker_operation(state, {'kind': 'confirm', 'index': index, 'speakerId': speaker_id})
 
+
+def reject_segment(state: TranscriptEditState, index: int) -> TranscriptEditState:
+  current = state.payload
+  if type(index) is not int or not 0 <= index < len(current['segments']):
+    raise TranscriptionError('Choose an existing transcript segment')
+  segment = current['segments'][index]
+  if segment.get('speakerState') != 'assigned' or segment.get('speakerId') is None:
+    raise TranscriptionError('Only an assigned speaker can be rejected')
+  if segment.get('speakerRejected') == segment['speakerId']:
+    return state
+  return _speaker_operation(state, {'kind': 'reject', 'index': index, 'speakerId': segment['speakerId']})
+
+
+def create_speaker_and_reassign(state: TranscriptEditState, index: int, name: str) -> TranscriptEditState:
+  current = state.payload
+  if type(index) is not int or not 0 <= index < len(current['segments']):
+    raise TranscriptionError('Choose an existing transcript segment')
+  if not isinstance(name, str) or not 1 <= len(name.strip()) <= 60:
+    raise TranscriptionError('Speaker name must be 1 to 60 characters')
+  speaker = {'id': str(uuid.uuid4()), 'source': current['segments'][index]['source'],
+             'name': name.strip(), 'label': f'Speaker {len(current["speakers"]) + 1}',
+             'origin': 'manual', 'runtimeTag': None}
+  return _speaker_operation(state, {'kind': 'create-speaker', 'index': index, 'speaker': speaker})
 
 def undo_transcript_edit(state: TranscriptEditState) -> TranscriptEditState:
   return TranscriptEditState(state._baseline, state._operations, max(0, state._cursor - 1), state._ancestors | {state._fingerprint()})
@@ -345,13 +381,46 @@ def _load_transcript_edit_state_locked(session: Path) -> TranscriptEditState:
           raise ValueError('invalid text operation')
         current['segments'][index]['text'] = operation['text']
       elif operation.get('kind') == 'rename':
-        if not isinstance(operation.get('speakerId'), str) or (
-            operation.get('name') is not None and not isinstance(operation['name'], str)):
-          raise ValueError('invalid rename operation')
-      elif operation.get('kind') in ('reassign', 'confirm'):
+        speaker = _registry_speaker(current, operation['speakerId'])
+        name = operation['name']
+        if name is None:
+          speaker.pop('name', None)
+        else:
+          speaker['name'] = name
+        _validate_v2(current, manifest['durationSeconds'])
+      elif operation.get('kind') in ('reassign', 'confirm', 'reject', 'create-speaker'):
         index = operation['index']
-        if type(index) is not int or not 0 <= index < len(current['segments']) or not isinstance(operation.get('speakerId'), str):
+        if type(index) is not int or not 0 <= index < len(current['segments']):
           raise ValueError('invalid speaker operation')
+        segment = current['segments'][index]
+        kind = operation['kind']
+        if kind == 'create-speaker':
+          speaker = operation['speaker']
+          if not isinstance(speaker, dict) or speaker.get('origin') != 'manual' or speaker.get('source') != segment['source']:
+            raise ValueError('invalid manual speaker operation')
+          current['speakers'].append(copy.deepcopy(speaker))
+          speaker_id = speaker['id']
+        else:
+          speaker_id = operation['speakerId']
+        if speaker_id is not None:
+          _registry_speaker(current, speaker_id, segment['source'])
+        elif kind != 'confirm':
+          raise ValueError('invalid speaker operation')
+        if kind in ('reassign', 'create-speaker'):
+          segment['speakerId'] = speaker_id
+          segment['speakerState'] = 'assigned'
+          segment.pop('speakerConfirmed', None)
+          segment.pop('speakerRejected', None)
+        elif kind == 'confirm':
+          if speaker_id is None:
+            segment.pop('speakerConfirmed', None)
+          else:
+            segment['speakerConfirmed'] = speaker_id
+            segment.pop('speakerRejected', None)
+        else:
+          segment['speakerRejected'] = speaker_id
+          segment.pop('speakerConfirmed', None)
+        _validate_v2(current, manifest['durationSeconds'])
       else:
         raise ValueError('unknown operation')
     state = TranscriptEditState(_encoded(baseline), tuple(_encoded(op) for op in operations), cursor)
@@ -653,17 +722,17 @@ def render_exports(transcript: dict) -> dict[str, str]:
           'transcript.txt': ''.join(text_lines), 'transcript.srt': ''.join(subtitles)}
 
 
-def _publish_exports(session_dir: Path, temporary: Path, exports: dict[str, str]) -> None:
+def _publish_exports(session_dir: Path, temporary: Path, exports: dict[str, str], *, cancelled=None) -> None:
   # Cancellation is delivered before staging or after the complete transaction,
   # never between canonical exports and their correction history.
   blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
   try:
-    _publish_exports_locked(session_dir, temporary, exports)
+    _publish_exports_locked(session_dir, temporary, exports, cancelled=cancelled)
   finally:
     signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
 
 
-def _publish_exports_locked(session_dir: Path, temporary: Path, exports: dict[str, str]) -> None:
+def _publish_exports_locked(session_dir: Path, temporary: Path, exports: dict[str, str], *, cancelled=None) -> None:
   # Stage every file before replacing any existing export. Each rename is atomic.
   previous = {}
   for name, content in exports.items():
@@ -679,11 +748,11 @@ def _publish_exports_locked(session_dir: Path, temporary: Path, exports: dict[st
   published = []
   try:
     for name in exports:
-      if signal.sigpending() & {signal.SIGINT, signal.SIGTERM}:
+      if (cancelled is not None and cancelled()) or signal.sigpending() & {signal.SIGINT, signal.SIGTERM}:
         raise OSError('Transcription cancelled before publication completed')
       os.replace(temporary / name, session_dir / name)
       published.append(name)
-    if signal.sigpending() & {signal.SIGINT, signal.SIGTERM}:
+    if (cancelled is not None and cancelled()) or signal.sigpending() & {signal.SIGINT, signal.SIGTERM}:
       raise OSError('Transcription cancelled before publication completed')
   except OSError:
     for name in published:
@@ -699,14 +768,15 @@ def _publish_exports_locked(session_dir: Path, temporary: Path, exports: dict[st
 
 
 def transcribe_session(session_dir: Path, *, profile, model=None, runtime=None, diarizer=None,
-                       language='en', threads=4, use_gpu=True) -> dict:
+                       language='en', threads=4, use_gpu=True, runtime_executor=None, cancelled=None) -> dict:
   with session_lock(session_dir):
     return _transcribe_session_locked(session_dir, profile=profile, model=model, runtime=runtime,
-      diarizer=diarizer, language=language, threads=threads, use_gpu=use_gpu)
+      diarizer=diarizer, language=language, threads=threads, use_gpu=use_gpu,
+      runtime_executor=runtime_executor, cancelled=cancelled)
 
 
 def _transcribe_session_locked(session_dir: Path, *, profile, model, runtime, diarizer,
-                               language, threads, use_gpu) -> dict:
+                               language, threads, use_gpu, runtime_executor=None, cancelled=None) -> dict:
   try:
     validate_options(profile=profile, model=model, runtime=runtime, diarizer=diarizer,
       language=language, threads=threads, use_gpu=use_gpu)
@@ -729,7 +799,8 @@ def _transcribe_session_locked(session_dir: Path, *, profile, model, runtime, di
           '--output', str(output), '--language', language, '--threads', str(threads), '--backend', backend]
         if diarizer is not None:
           command += ['--diarizer', str(diarizer.resolve())]
-        process = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        process = (runtime_executor(command) if runtime_executor is not None else
+          subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
         if process.returncode:
           raise TranscriptionError(f'{source}: {profile} runtime exited {process.returncode}: {process.stderr.strip()}')
         outputs[source] = _load_json(output)
@@ -739,7 +810,7 @@ def _transcribe_session_locked(session_dir: Path, *, profile, model, runtime, di
       else:
         operations = previous._operations[:previous._cursor] + (_encoded({'kind': 'replace', 'payload': transcript}),)
         state = TranscriptEditState(previous._baseline, operations, len(operations))
-      _publish_exports(session_dir, temporary, _state_exports(state))
+      _publish_exports(session_dir, temporary, _state_exports(state), cancelled=cancelled)
       return transcript
   except (OSError, ValueError) as error:
     raise TranscriptionError(f'Transcription failed: {error}') from error

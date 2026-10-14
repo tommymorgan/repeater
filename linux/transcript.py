@@ -55,6 +55,8 @@ class TranscriptPane(Gtk.Stack):
         self.redo = redo
         self._buffers = {}
         self._editors = []
+        self._speaker_buttons = {}
+        self._turn_widgets = {}
         self._previews = []
         self._review_slots = {}
         self._review_findings = []
@@ -159,6 +161,11 @@ class TranscriptPane(Gtk.Stack):
             row.set_expanded(expand)
         self._update_expand_caption()
 
+    def _speaker_name(self, segment):
+        named = any(speaker['id'] == segment.get('speakerId') and speaker.get('name')
+                    for speaker in self._payload.get('speakers', []))
+        return speaker_label(self._payload, segment, include_source=not named)
+
     def _heading(self, segments, snippet=False):
         first = segments[0]
         heading = Gtk.Grid(column_spacing=8, row_spacing=4, hexpand=True)
@@ -167,7 +174,7 @@ class TranscriptPane(Gtk.Stack):
         key = ('turn' if snippet else 'segment', tuple(segment['_index'] for segment in segments))
         start = min(segment['startTime'] for segment in segments)
         end = max(segment['endTime'] for segment in segments)
-        name = speaker_label(self._payload, first, include_source=True)
+        name = self._speaker_name(first)
         caption = f'Play {name} audio, {_timestamp(start)}–{_timestamp(end)}'
         play_button = Gtk.Button(icon_name='media-playback-start-symbolic', tooltip_text=caption)
         play_button.add_css_class('flat')
@@ -175,8 +182,10 @@ class TranscriptPane(Gtk.Stack):
         play_button.connect('clicked', lambda *_: self.play(first['source'], start, end, key) if self.play else None)
         play_button.set_sensitive(end > start)
         self._play_buttons[key] = (play_button, caption, end > start)
-        title.append(self._speaker_menu(first, segments))
-        title.append(_label(name, 'heading'))
+        title.append(self._speaker_button(first, name))
+        if snippet:
+            for segment in segments:
+                self._turn_widgets[segment['_index']] = heading
         heading.attach(title, text_column, 0, 1, 1)
 
         preview = None
@@ -195,71 +204,44 @@ class TranscriptPane(Gtk.Stack):
         title.append(time)
         title.append(play_button)
         return heading, preview, f'{name}, {time_range}'
-    def _speaker_menu(self, segment, segments):
-        """Per-turn speaker controls: confirm (✓), reassign, rename-all."""
+    def _speaker_button(self, segment, name):
         if self._payload.get('schemaVersion') != 2 or not self.speaker_action:
-            return Gtk.Box()
-        speaker = next((entry for entry in self._payload['speakers']
-                        if entry['id'] == segment.get('speakerId')), None)
-        name = (speaker or {}).get('name') or (speaker or {}).get('label') or 'speaker'
-        confirmed = segment.get('speakerConfirmed') is not None
-        popover = Gtk.Popover()
-        def build_once(*_):
-            if popover.get_child() is not None:
-                return
-            column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
-                             margin_top=8, margin_bottom=8, margin_start=8, margin_end=8)
-            state = Gtk.Label(xalign=0, wrap=True)
-            state.set_text(f'{"✓ Confirmed" if confirmed else "Not confirmed yet"} · {name} ({segment["source"]})')
-            column.append(state)
-            confirm = Gtk.Button(label='Unconfirm' if confirmed else '✓ Confirm speaker')
-            confirm.connect('clicked', lambda *_: self.speaker_action('confirm', segment['_index'], None))
-            column.append(confirm)
-            self._hint_rows(segment, column)
-            others = [entry for entry in self._payload['speakers']
-                      if entry['source'] == segment['source'] and entry['id'] != segment.get('speakerId')]
-            if others:
-                column.append(_label('This snippet is someone else:', 'caption'))
-                for entry in others:
-                    choice = Gtk.Button(label=entry.get('name') or entry['label'])
-                    choice.connect('clicked', lambda *_, sid=entry['id']:
-                                   self.speaker_action('reassign', segment['_index'], sid))
-                    column.append(choice)
-            rename = Gtk.Button(label='Rename this speaker everywhere…')
-            rename.connect('clicked', lambda *_: self.speaker_action('rename', segment['_index'], None))
-            column.append(rename)
-            popover.set_child(column)
-        popover.connect('map', build_once)
-        button = Gtk.MenuButton(icon_name='avatar-default-symbolic', tooltip_text=f'Confirm or edit {name}')
-        button.set_popover(popover)
-        button.add_css_class('flat')
-        if confirmed:
-            button.add_css_class('suggested-action')
-        return button
-
+            return _label(name, 'heading')
+        identity = Gtk.Box(spacing=8)
+        identity.append(Gtk.Image(icon_name='avatar-default-symbolic'))
+        identity.append(Gtk.Label(label=name, xalign=0, css_classes=['heading']))
+        control = Gtk.Button(child=identity, tooltip_text=f'Open Speakers: {name}')
+        control.add_css_class('flat')
+        control.update_property([Gtk.AccessibleProperty.LABEL], [f'Open Speakers: {name}'])
+        control.connect('clicked', lambda *_: self.speaker_action('open', segment['_index'], None))
+        self._speaker_buttons[segment['_index']] = control
+        return control
     def set_voice_hints(self, hints):
         """Show tiered voice matches: {speakerId: {'name','score','tier','profileId'}}."""
         self.voice_hints = hints or {}
 
-    def _hint_rows(self, segment, column):
-        hint = self.voice_hints.get(segment.get('speakerId'))
-        if not hint or segment.get('speakerConfirmed'):
-            return
-        score = hint['score']
-        if hint['tier'] == 'auto':
-            column.append(_label(f'Voice match: {hint["name"]} (score {score:.2f}) — this speaker is a remembered voice', 'caption', wrap=True))
-        else:
-            row = Gtk.Box(spacing=6)
-            row.append(_label(f'Sounds like {hint["name"]} (score {score:.2f})', 'caption'))
-            yes = Gtk.Button(label='That’s right')
-            yes.add_css_class('suggested-action')
-            yes.connect('clicked', lambda *_: self.speaker_action('hint-yes', segment['_index'], hint['profileId']))
-            no = Gtk.Button(label='Not them')
-            no.connect('clicked', lambda *_: self.speaker_action('hint-no', segment['_index'], hint['profileId']))
-            row.append(yes)
-            row.append(no)
-            column.append(row)
-
+    def show_segment(self, index):
+        self._thread_button.set_active(True)
+        generation = self._build_generation
+        def reveal():
+            if generation != self._build_generation:
+                return GLib.SOURCE_REMOVE
+            heading = self._turn_widgets.get(index)
+            if heading is None:
+                return GLib.SOURCE_CONTINUE
+            expander = heading.get_child_at(0, 0)
+            if isinstance(expander, Gtk.Expander):
+                expander.set_expanded(True)
+            scroller = self.get_child_by_name('thread')
+            def scroll():
+                if generation == self._build_generation:
+                    ok, bounds = heading.compute_bounds(self._thread)
+                    if ok:
+                        scroller.get_vadjustment().set_value(bounds.get_y())
+                return GLib.SOURCE_REMOVE
+            GLib.idle_add(scroll)
+            return GLib.SOURCE_REMOVE
+        GLib.idle_add(reveal)
     def _append_thread(self, segments, expanded):
         if self._thread.get_first_child():
             self._thread.append(Gtk.Separator())
@@ -469,7 +451,7 @@ class TranscriptPane(Gtk.Stack):
         view.set_valign(Gtk.Align.START)
         view.add_css_class('transcript-paragraph')
         view.update_property([Gtk.AccessibleProperty.LABEL],
-                             [f"{speaker_label(self._payload, segment, include_source=True)} at {_timestamp(segment['startTime'])}, editable transcript"])
+                             [f"{self._speaker_name(segment)} at {_timestamp(segment['startTime'])}, editable transcript"])
         keys = Gtk.EventControllerKey()
         keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         keys.connect('key-pressed', self._editor_key)
@@ -503,6 +485,8 @@ class TranscriptPane(Gtk.Stack):
         self._timeline_built = False
         self._build_generation += 1
         self._buffers.clear()
+        self._speaker_buttons.clear()
+        self._turn_widgets.clear()
         self._editors.clear()
         self._play_buttons.clear()
         self._previews.clear()
