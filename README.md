@@ -64,7 +64,7 @@ The existing `parrot.py` filename and `parrot` storage namespace are retained fo
 
 ## Privacy and recovery limits
 
-**Use headphones and obtain recording consent.** The selected output monitor captures all audio routed to that output, not just the meeting. Linux capture has no acoustic echo cancellation, so speaker audio can leak into the microphone track.
+The selected output monitor captures all audio routed to that output, not just the meeting. Linux capture has no acoustic echo cancellation, so speaker audio can leak into the microphone track.
 
 - Audio, transcription, speaker profiles and corrections remain local. Optional review sends transcript text—not audio—to the local or private-network endpoint you configure, with no cloud fallback.
 - Recordings live under `${XDG_DATA_HOME:-$HOME/.local/share}/parrot/meetings/`; settings live under `${XDG_CONFIG_HOME:-$HOME/.config}/parrot/settings.json`. Recordings and downloaded models are excluded from version control.
