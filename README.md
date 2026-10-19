@@ -4,6 +4,10 @@ Local-first conversation recording and offline transcription for Linux. Repeater
 
 This is a development fork of [Parrot](https://github.com/turantekin/Parrot), not the original macOS application. The Linux application uses Python, GTK 4, libadwaita, PipeWire and local speech models. Parrot's SwiftUI application, live assistant and cloud integrations are not Repeater features.
 
+![Repeater's native Linux app showing recording history and a speaker-labeled transcript](docs/screenshots/repeater-linux.png)
+
+*Actual GTK application with synthetic sample conversations; no private meeting content.*
+
 ## What works today
 
 - **Explicit two-track recording.** Choose a microphone and the output carrying your call. Start and stop capture yourself; no meeting bot joins the call.
