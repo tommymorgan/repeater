@@ -952,6 +952,15 @@ class RepeaterWindow(Adw.ApplicationWindow):
                     'playback': 'Your transcript and corrections are unchanged. Check that the saved audio is available and an audio output is connected, then try Play again.',
                     'review': 'Your saved review progress, transcript and corrections are unchanged. Check review settings, then retry.',
                     'other': 'Your saved recording and transcript are unchanged. Check the technical details before trying again.'}
+        if kind == 'transcribe' and any(message in details.lower() for message in
+                                       ('cuda out of memory', 'cuda error: out of memory')):
+            titles[kind] = 'Not enough GPU memory'
+            messages[kind] = (
+                'The transcription model could not fit in the available GPU memory. '
+                'Your saved audio and any previous transcript or corrections are unchanged. '
+                'Close another GPU-heavy app or unload an unused model, then retry. '
+                'Alternatively, open Settings and turn off Use GPU to transcribe on the CPU '
+                '(slower). Transcribe after stopping can stay on.')
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
                           margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
         title = label(titles[kind], 'heading')
